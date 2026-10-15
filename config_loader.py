@@ -17,6 +17,9 @@ class Config:
         
         # 运行模式配置
         self.mode = self.config_data.get('mode', 'monitor_only')  # monitor_only 或 monitor_and_buy
+
+        # 同地区完整克隆；不自动关停源实例，源实例必须预先关机。
+        self.clone = self.config_data.get('clone', {})
         
         # GPU 配置
         self.gpu_model = self.config_data['gpu']['model']

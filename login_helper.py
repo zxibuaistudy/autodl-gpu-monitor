@@ -11,7 +11,7 @@ from fake_useragent import UserAgent
 
 def update_config_authorization(token):
     """更新配置文件中的 authorization"""
-    config_path = Path(__file__).parent.parent / 'config.json'
+    config_path = Path(__file__).parent / 'config.json'
     
     if config_path.exists():
         with open(config_path, 'r', encoding='utf-8') as f:

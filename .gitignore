@@ -4,7 +4,13 @@
 # config
 config.py
 config copy.json
+/config.json
+.env
 
 # pycharm
 .idea
 __pycache__
+.pytest_cache/
+clone_state.json
+clone_state.json.tmp
+clone_state.lock

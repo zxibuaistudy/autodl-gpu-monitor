@@ -6,6 +6,7 @@ import time
 import json
 
 import watch
+from clone import run_clone_monitor
 
 # 检查是否有 authorization，如果没有则登录
 if not config.has_authorization():
@@ -50,7 +51,10 @@ def send_notification(title, content, gpu_info=None, wallet_info=None):
         return {"status": "skipped", "message": "未配置sendkey"}
 
 # 根据配置模式选择运行方式
-if config.mode == "monitor_only":
+if config.mode == "monitor_and_clone":
+    run_clone_monitor(config, send_notification)
+
+elif config.mode == "monitor_only":
     print("运行模式: 仅监控")
     print("开始监控GPU...")
     
@@ -125,4 +129,4 @@ elif config.mode == "monitor_and_buy":
 
 else:
     print(f"未知的运行模式: {config.mode}")
-    print("支持的模式: monitor_only, monitor_and_buy")
+    print("支持的模式: monitor_only, monitor_and_buy, monitor_and_clone")
