@@ -170,6 +170,188 @@ class CloneTests(unittest.TestCase):
         self.assertEqual(Client.calls, 2)
         self.assertEqual(Client.clone_calls, 0)
 
+    def test_facility_rejection_skips_machine_and_submits_to_next(self):
+        bad_machine = {**self.machine, "machine_id": "machine-unsupported"}
+        good_machine = {**self.machine, "machine_id": "machine-supported"}
+
+        class Client:
+            submitted = []
+
+            def __init__(self, authorization):
+                pass
+
+            def instances(self):
+                return [{**source, "status": "shutdown"}]
+
+            def regions(self):
+                return [{"region_sign": sign, "data_center": "nmDC3",
+                         "setting": {"clone_instance": True}}
+                        for sign in ("nm-B1", "nm-B2")]
+
+            def machines(self, region, model, amount):
+                return [bad_machine, good_machine]
+
+            def snapshot(self, uuid):
+                return snapshot
+
+            def clone(self, body):
+                machine_id = body["instance_info"]["machine_id"]
+                Client.submitted.append(machine_id)
+                if machine_id == "machine-unsupported":
+                    raise clone.APIRejected("FacilityNotSupported", "目标机器暂不支持克隆实例")
+                return "instance-target"
+
+        source, snapshot = self.source, self.snapshot
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source",
+                                        "copy_data_disk": True})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", Client), patch.object(clone, "track"):
+                clone.run_clone_monitor(config, lambda *args: None)
+                state = clone.load_state()
+        self.assertEqual(Client.submitted, ["machine-unsupported", "machine-supported"])
+        self.assertEqual(state["stage"], "tracking")
+        self.assertEqual(state["target_instance_uuid"], "instance-target")
+        self.assertEqual(state["excluded_machine_ids"], ["machine-unsupported"])
+
+    def test_legacy_facility_rejection_resumes_without_retrying_bad_machine(self):
+        bad_machine = {**self.machine, "machine_id": "machine-unsupported"}
+        good_machine = {**self.machine, "machine_id": "machine-supported"}
+
+        class Client:
+            def __init__(self, authorization):
+                pass
+
+            def instances(self):
+                return [{**source, "status": "shutdown"}]
+
+            def regions(self):
+                return [{"region_sign": sign, "data_center": "nmDC3",
+                         "setting": {"clone_instance": True}}
+                        for sign in ("nm-B1", "nm-B2")]
+
+            def machines(self, region, model, amount):
+                return [bad_machine, good_machine]
+
+            def snapshot(self, uuid):
+                return snapshot
+
+            def clone(self, body):
+                raise AssertionError("演练模式不应提交克隆")
+
+        source, snapshot = self.source, self.snapshot
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source",
+                                        "copy_data_disk": True, "dry_run": True})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", Client):
+                clone.save_state({"stage": "rejected", "source_instance_uuid": "instance-source",
+                                  "target_machine_id": "machine-unsupported",
+                                  "target_instance_uuid": None,
+                                  "error": "FacilityNotSupported: /order/instance/clone/payg: unsupported"})
+                with patch("builtins.print") as output:
+                    clone.run_clone_monitor(config, lambda *args: None)
+                self.assertEqual(clone.load_state()["stage"], "monitoring")
+        printed = " ".join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertIn("machine-supported", printed)
+        self.assertNotIn("machine-unsupported", printed)
+
+    def test_facility_rejection_is_not_retried_on_next_poll(self):
+        class StopPolling(Exception):
+            pass
+
+        class Client:
+            submitted = 0
+
+            def __init__(self, authorization):
+                pass
+
+            def instances(self):
+                return [{**source, "status": "shutdown"}]
+
+            def regions(self):
+                return [{"region_sign": sign, "data_center": "nmDC3",
+                         "setting": {"clone_instance": True}}
+                        for sign in ("nm-B1", "nm-B2")]
+
+            def machines(self, region, model, amount):
+                return [machine]
+
+            def snapshot(self, uuid):
+                return snapshot
+
+            def clone(self, body):
+                Client.submitted += 1
+                raise clone.APIRejected("FacilityNotSupported", "目标机器暂不支持克隆实例")
+
+        source, snapshot, machine = self.source, self.snapshot, self.machine
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source",
+                                        "copy_data_disk": True})
+        polls = 0
+
+        def sleep_once(seconds):
+            nonlocal polls
+            polls += 1
+            if polls == 2:
+                raise StopPolling
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", Client), \
+                 patch.object(clone.time, "sleep", side_effect=sleep_once):
+                with self.assertRaises(StopPolling):
+                    clone.run_clone_monitor(config, lambda *args: None)
+                state = clone.load_state()
+        self.assertEqual(Client.submitted, 1)
+        self.assertEqual(state["stage"], "monitoring")
+        self.assertEqual(state["excluded_machine_ids"], ["machine-target"])
+
+    def test_other_rejection_still_blocks_retry(self):
+        class Client:
+            submitted = 0
+
+            def __init__(self, authorization):
+                pass
+
+            def instances(self):
+                return [{**source, "status": "shutdown"}]
+
+            def regions(self):
+                return [{"region_sign": sign, "data_center": "nmDC3",
+                         "setting": {"clone_instance": True}}
+                        for sign in ("nm-B1", "nm-B2")]
+
+            def machines(self, region, model, amount):
+                return [machine]
+
+            def snapshot(self, uuid):
+                return snapshot
+
+            def clone(self, body):
+                Client.submitted += 1
+                raise clone.APIRejected("OtherFailure", "unsupported")
+
+        source, snapshot, machine = self.source, self.snapshot, self.machine
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source",
+                                        "copy_data_disk": True})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", Client):
+                with self.assertRaises(clone.APIRejected):
+                    clone.run_clone_monitor(config, lambda *args: None)
+                self.assertEqual(clone.load_state()["stage"], "rejected")
+                with self.assertRaises(clone.CloneError):
+                    clone.run_clone_monitor(config, lambda *args: None)
+        self.assertEqual(Client.submitted, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -299,6 +299,7 @@ def run_clone_monitor(config, notifier):
     with single_process():
         client = AutoDL(config.Authorization)
         state = load_state()
+        skipped_machines = set()
         if state:
             if state.get("source_instance_uuid") != source_uuid:
                 raise CloneError("已有其他源实例的克隆记录，请先人工核实 clone_state.json")
@@ -306,7 +307,23 @@ def run_clone_monitor(config, notifier):
                 print("恢复已有克隆任务，继续跟踪结果")
                 track(client, state, notifier)
                 return
-            raise CloneError(f"已有克隆记录（{state.get('stage')}），请核实 clone_state.json 和 AutoDL 网页后再处理")
+            if state.get("stage") == "rejected" and not state.get("target_instance_uuid"):
+                error_code = state.get("error_code") or str(state.get("error", "")).split(":", 1)[0]
+                if error_code == "FacilityNotSupported" and state.get("target_machine_id"):
+                    # 兼容旧版留下的明确拒绝记录；没有目标实例，可继续找其他机器。
+                    state["stage"] = "monitoring"
+                    state["excluded_machine_ids"] = [state["target_machine_id"]]
+                    state["error_code"] = error_code
+                    save_state(state)
+            if state.get("stage") == "monitoring" and not state.get("target_instance_uuid"):
+                excluded = state.get("excluded_machine_ids", [])
+                if not isinstance(excluded, list) or any(not isinstance(item, str) or not item for item in excluded):
+                    raise CloneError("克隆状态中的目标机器排除列表无效，请人工核实 clone_state.json")
+                skipped_machines.update(excluded)
+                if skipped_machines:
+                    print(f"继续监控，已跳过 {len(skipped_machines)} 台明确不支持克隆的目标机器")
+            else:
+                raise CloneError(f"已有克隆记录（{state.get('stage')}），请核实 clone_state.json 和 AutoDL 网页后再处理")
 
         print("开始监控同地区 GPU；源实例必须保持关机")
         while True:
@@ -321,6 +338,8 @@ def run_clone_monitor(config, notifier):
             if source.get("status") != "shutdown":
                 raise CloneError(f"源实例状态为 {source.get('status')}；请先在网页关机")
             for machine in machines:
+                if machine.get("machine_id") in skipped_machines:
+                    continue
                 if int(machine.get("gpu_idle_num") or 0) < amount:
                     continue
                 if machine.get("region_sign") and machine["region_sign"] not in group:
@@ -343,16 +362,25 @@ def run_clone_monitor(config, notifier):
                     "stage": "submitting", "source_instance_uuid": source_uuid,
                     "target_machine_id": machine["machine_id"], "started_at": utc_now(),
                     "target_instance_uuid": None,
+                    "excluded_machine_ids": sorted(skipped_machines),
                 }
                 save_state(state)
                 try:
                     target_uuid = client.clone(body)
                 except APIRejected as exc:
-                    if exc.code == "MachineGpuNumUpdateFailed":
-                        print(f"目标机器 {machine['machine_id']} 库存已变化: {exc}")
-                        STATE_PATH.unlink(missing_ok=True)
+                    if exc.code in {"MachineGpuNumUpdateFailed", "FacilityNotSupported"}:
+                        if exc.code == "FacilityNotSupported":
+                            skipped_machines.add(machine["machine_id"])
+                            print(f"跳过不支持克隆的目标机器 {machine['machine_id']}: {exc}")
+                        else:
+                            print(f"目标机器 {machine['machine_id']} 库存已变化: {exc}")
+                        state.update({"stage": "monitoring", "error_code": exc.code,
+                                      "error": str(exc),
+                                      "excluded_machine_ids": sorted(skipped_machines)})
+                        save_state(state)
                         continue
                     state["stage"] = "rejected"
+                    state["error_code"] = exc.code
                     state["error"] = str(exc)
                     save_state(state)
                     raise
