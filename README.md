@@ -93,4 +93,4 @@ python -m unittest test_clone -v
 
 ## 致谢与授权说明
 
-项目原有监控与购买功能部分参考 [autogpu](https://github.com/lemonmindyes/autogpu)。在确认原作者代码的再授权许可之前，本仓库暂不附加新的开源许可证；公开可查看源码不等于授予第三方复制、修改和再分发的权利。若你计划复用这些代码，请先核实相应权利。
+本仓库是 [Jiayi-Fu/autodl-gpu-monitor](https://github.com/Jiayi-Fu/autodl-gpu-monitor) 的 GitHub Fork；原有监控与购买功能部分参考了 [autogpu](https://github.com/lemonmindyes/autogpu)。原仓库和参考项目目前没有明确的开源许可证，本 Fork 也不擅自为其代码添加许可证。公开可查看及在 GitHub 上 Fork，并不等于获得任意复制、修改和再分发的许可；若计划在 GitHub Fork 之外复用或发布这些代码，请先联系相应作者确认授权。
