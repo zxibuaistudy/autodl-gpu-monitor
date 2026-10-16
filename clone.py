@@ -10,6 +10,8 @@ from pathlib import Path
 import requests
 
 BASE_URL = "https://www.autodl.com/api/v1"
+CLONE_ORDER_PATH = "/order/instance/clone/payg"
+MACHINE_FULL_MESSAGE = "该主机已租满，请更换主机重新创建实例"
 STATE_PATH = Path(__file__).with_name("clone_state.json")
 LOCK_PATH = Path(__file__).with_name("clone_state.lock")
 POLL_SECONDS = 30
@@ -27,6 +29,14 @@ class APIRejected(CloneError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(f"{code}: {message}")
+
+
+def skippable_target_rejection(code, error):
+    """仅将已知且明确指向目标机器的拒绝视为可换机器重试。"""
+    return code == "FacilityNotSupported" or (
+        code == "InternalError" and
+        str(error).strip() == f"InternalError: {CLONE_ORDER_PATH}: {MACHINE_FULL_MESSAGE}"
+    )
 
 
 def save_state(state):
@@ -121,7 +131,7 @@ class AutoDL:
         return data.get("list") or []
 
     def clone(self, body):
-        return self.request("POST", "/order/instance/clone/payg", body=body)
+        return self.request("POST", CLONE_ORDER_PATH, body=body)
 
 
 def region_group(source_sign, regions):
@@ -309,10 +319,15 @@ def run_clone_monitor(config, notifier):
                 return
             if state.get("stage") == "rejected" and not state.get("target_instance_uuid"):
                 error_code = state.get("error_code") or str(state.get("error", "")).split(":", 1)[0]
-                if error_code == "FacilityNotSupported" and state.get("target_machine_id"):
-                    # 兼容旧版留下的明确拒绝记录；没有目标实例，可继续找其他机器。
+                if skippable_target_rejection(error_code, state.get("error")) and state.get("target_machine_id"):
+                    # 兼容旧版留下的明确拒绝记录，保留先前已排除的机器。
+                    excluded = state.get("excluded_machine_ids", [])
+                    if not isinstance(excluded, list) or any(
+                        not isinstance(item, str) or not item for item in excluded
+                    ):
+                        raise CloneError("克隆状态中的目标机器排除列表无效，请人工核实 clone_state.json")
                     state["stage"] = "monitoring"
-                    state["excluded_machine_ids"] = [state["target_machine_id"]]
+                    state["excluded_machine_ids"] = sorted(set(excluded) | {state["target_machine_id"]})
                     state["error_code"] = error_code
                     save_state(state)
             if state.get("stage") == "monitoring" and not state.get("target_instance_uuid"):
@@ -321,7 +336,7 @@ def run_clone_monitor(config, notifier):
                     raise CloneError("克隆状态中的目标机器排除列表无效，请人工核实 clone_state.json")
                 skipped_machines.update(excluded)
                 if skipped_machines:
-                    print(f"继续监控，已跳过 {len(skipped_machines)} 台明确不支持克隆的目标机器")
+                    print(f"继续监控，已跳过 {len(skipped_machines)} 台不支持克隆或已租满的目标机器")
             else:
                 raise CloneError(f"已有克隆记录（{state.get('stage')}），请核实 clone_state.json 和 AutoDL 网页后再处理")
 
@@ -368,10 +383,10 @@ def run_clone_monitor(config, notifier):
                 try:
                     target_uuid = client.clone(body)
                 except APIRejected as exc:
-                    if exc.code in {"MachineGpuNumUpdateFailed", "FacilityNotSupported"}:
-                        if exc.code == "FacilityNotSupported":
+                    if exc.code == "MachineGpuNumUpdateFailed" or skippable_target_rejection(exc.code, exc):
+                        if skippable_target_rejection(exc.code, exc):
                             skipped_machines.add(machine["machine_id"])
-                            print(f"跳过不支持克隆的目标机器 {machine['machine_id']}: {exc}")
+                            print(f"跳过不可用的目标机器 {machine['machine_id']}: {exc}")
                         else:
                             print(f"目标机器 {machine['machine_id']} 库存已变化: {exc}")
                         state.update({"stage": "monitoring", "error_code": exc.code,

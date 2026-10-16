@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import clone
 import requests
@@ -69,6 +69,13 @@ class CloneTests(unittest.TestCase):
             {"expand_data_disk_gb": 2},
         )
         self.assertTrue(body["instance_info"]["copy_data_disk_after_clone"])
+
+    def test_only_exact_machine_full_internal_error_is_skippable(self):
+        full = f"InternalError: {clone.CLONE_ORDER_PATH}: {clone.MACHINE_FULL_MESSAGE}"
+        self.assertTrue(clone.skippable_target_rejection("InternalError", full))
+        self.assertFalse(clone.skippable_target_rejection("InternalError", "InternalError: database unavailable"))
+        self.assertFalse(clone.skippable_target_rejection("InternalError", full + "，可能已创建"))
+        self.assertFalse(clone.skippable_target_rejection("AnotherError", full))
 
     def test_tracks_data_disk_completion(self):
         class Client:
@@ -312,6 +319,66 @@ class CloneTests(unittest.TestCase):
         self.assertEqual(state["stage"], "monitoring")
         self.assertEqual(state["excluded_machine_ids"], ["machine-target"])
 
+    def test_machine_full_rejection_skips_to_next_candidate(self):
+        full_machine = {**self.machine, "machine_id": "machine-full"}
+        free_machine = {**self.machine, "machine_id": "machine-free"}
+        client = MagicMock()
+        client.instances.return_value = [{**self.source, "status": "shutdown"}]
+        client.regions.return_value = [{"region_sign": sign, "data_center": "nmDC3",
+                                        "setting": {"clone_instance": True}}
+                                       for sign in ("nm-B1", "nm-B2")]
+        client.machines.return_value = [full_machine, free_machine]
+        client.snapshot.return_value = self.snapshot
+        client.clone.side_effect = [
+            clone.APIRejected("InternalError", f"{clone.CLONE_ORDER_PATH}: {clone.MACHINE_FULL_MESSAGE}"),
+            "instance-target",
+        ]
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source", "copy_data_disk": True})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", return_value=client), patch.object(clone, "track"):
+                clone.run_clone_monitor(config, lambda *args: None)
+                state = clone.load_state()
+        submitted = [call.args[0]["instance_info"]["machine_id"] for call in client.clone.call_args_list]
+        self.assertEqual(submitted, ["machine-full", "machine-free"])
+        self.assertEqual(state["stage"], "tracking")
+        self.assertEqual(state["excluded_machine_ids"], ["machine-full"])
+
+    def test_existing_machine_full_rejection_keeps_previous_skips(self):
+        machines = [{**self.machine, "machine_id": machine_id}
+                    for machine_id in ("old-unsupported", "machine-full", "machine-free")]
+        client = MagicMock()
+        client.instances.return_value = [{**self.source, "status": "shutdown"}]
+        client.regions.return_value = [{"region_sign": sign, "data_center": "nmDC3",
+                                        "setting": {"clone_instance": True}}
+                                       for sign in ("nm-B1", "nm-B2")]
+        client.machines.return_value = machines
+        client.snapshot.return_value = self.snapshot
+        config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
+                                 clone={"source_instance_uuid": "instance-source",
+                                        "copy_data_disk": True, "dry_run": True})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(clone, "STATE_PATH", Path(directory) / "state.json"), \
+                 patch.object(clone, "LOCK_PATH", Path(directory) / "lock"), \
+                 patch.object(clone, "AutoDL", return_value=client):
+                clone.save_state({"stage": "rejected", "source_instance_uuid": "instance-source",
+                                  "target_machine_id": "machine-full", "target_instance_uuid": None,
+                                  "excluded_machine_ids": ["old-unsupported"],
+                                  "error_code": "InternalError",
+                                  "error": f"InternalError: {clone.CLONE_ORDER_PATH}: {clone.MACHINE_FULL_MESSAGE}"})
+                with patch("builtins.print") as output:
+                    clone.run_clone_monitor(config, lambda *args: None)
+                state = clone.load_state()
+        self.assertEqual(state["stage"], "monitoring")
+        self.assertEqual(state["excluded_machine_ids"], ["machine-full", "old-unsupported"])
+        client.clone.assert_not_called()
+        printed = " ".join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertIn("machine-free", printed)
+        self.assertNotIn("old-unsupported", printed)
+        self.assertNotIn("machine-full", printed)
+
     def test_other_rejection_still_blocks_retry(self):
         class Client:
             submitted = 0
@@ -335,7 +402,7 @@ class CloneTests(unittest.TestCase):
 
             def clone(self, body):
                 Client.submitted += 1
-                raise clone.APIRejected("OtherFailure", "unsupported")
+                raise clone.APIRejected("InternalError", "unrelated internal failure")
 
         source, snapshot, machine = self.source, self.snapshot, self.machine
         config = SimpleNamespace(Authorization="fake", gpu_model="RTX 4090", gpu_num=1,
